@@ -1,16 +1,18 @@
-from typing import Optional, List, Dict, Any
-from sqlalchemy import select, and_
+from typing import Any, Dict, List, Optional
+
+from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+
+from .encryption import get_encryption_service
 from .models import (
+    Conversation,
+    MCPServer,
+    Message,
     User,
     UserCredential,
-    MCPServer,
     UserServerConfig,
-    Conversation,
-    Message,
 )
-from .encryption import get_encryption_service
 
 
 class UserRepository:
@@ -46,7 +48,7 @@ class UserRepository:
                 and_(
                     User.slack_user_id == slack_user_id,
                     User.slack_team_id == slack_team_id,
-                    User.is_active == True,
+                    User.is_active,
                 )
             )
             .options(selectinload(User.credentials), selectinload(User.server_configs))
@@ -84,7 +86,7 @@ class CredentialRepository:
         credential = existing.scalar_one_or_none()
 
         if credential:
-            credential.encrypted_value = encrypted_value
+            credential.encrypted_value = encrypted_value  # type: ignore[assignment]
         else:
             credential = UserCredential(
                 user_id=user_id,
@@ -112,7 +114,7 @@ class CredentialRepository:
         credential = result.scalar_one_or_none()
 
         if credential:
-            return self.encryption.decrypt(credential.encrypted_value)
+            return self.encryption.decrypt(credential.encrypted_value)  # type: ignore[arg-type]
         return None
 
     async def get_user_credentials(self, user_id: int) -> Dict[str, Dict[str, str]]:
@@ -126,7 +128,7 @@ class CredentialRepository:
             if cred.credential_type not in decrypted:
                 decrypted[cred.credential_type] = {}
             decrypted[cred.credential_type][cred.credential_name] = (
-                self.encryption.decrypt(cred.encrypted_value)
+                self.encryption.decrypt(cred.encrypted_value)  # type: ignore[arg-type]
             )
 
         return decrypted
@@ -159,15 +161,13 @@ class ServerRepository:
 
     async def get_server_by_name(self, name: str) -> Optional[MCPServer]:
         result = await self.session.execute(
-            select(MCPServer).where(
-                and_(MCPServer.name == name, MCPServer.is_active == True)
-            )
+            select(MCPServer).where(and_(MCPServer.name == name, MCPServer.is_active))
         )
         return result.scalar_one_or_none()
 
     async def get_all_servers(self) -> List[MCPServer]:
         result = await self.session.execute(
-            select(MCPServer).where(MCPServer.is_active == True)
+            select(MCPServer).where(MCPServer.is_active)
         )
         return list(result.scalars().all())
 
@@ -178,8 +178,8 @@ class ServerRepository:
             .where(
                 and_(
                     UserServerConfig.user_id == user_id,
-                    UserServerConfig.is_enabled == True,
-                    MCPServer.is_active == True,
+                    UserServerConfig.is_enabled,
+                    MCPServer.is_active,
                 )
             )
         )
@@ -204,8 +204,8 @@ class UserServerConfigRepository:
         config = existing.scalar_one_or_none()
 
         if config:
-            config.is_enabled = True
-            config.custom_env = custom_env or {}
+            config.is_enabled = True  # type: ignore[assignment]
+            config.custom_env = custom_env or {}  # type: ignore[assignment]
         else:
             config = UserServerConfig(
                 user_id=user_id,
@@ -230,7 +230,7 @@ class UserServerConfigRepository:
         config = result.scalar_one_or_none()
 
         if config:
-            config.is_enabled = False
+            config.is_enabled = False  # type: ignore[assignment]
             await self.session.flush()
             return True
         return False

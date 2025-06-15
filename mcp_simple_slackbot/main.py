@@ -4,26 +4,24 @@ import logging
 import os
 import sys
 from typing import Any, Dict, List, Optional
-from contextlib import asynccontextmanager
 
 import httpx
 from dotenv import load_dotenv
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
-from slack_sdk.web.async_client import AsyncWebClient
 from slack_sdk.errors import SlackApiError
+from slack_sdk.web.async_client import AsyncWebClient
 
-from .database.session import get_db_manager
 from .database.repositories import (
-    UserRepository,
+    ConversationRepository,
     CredentialRepository,
     ServerRepository,
-    ConversationRepository,
-    UserServerConfigRepository,
+    UserRepository,
 )
-from .services.user_server import UserServerManager
-from .services.slack_auth import SlackAuthService
+from .database.session import get_db_manager
 from .services.mcp_metadata import MCPMetadataParser
+from .services.slack_auth import SlackAuthService
+from .services.user_server import UserServerManager
 
 # Configure logging
 logging.basicConfig(
@@ -117,7 +115,7 @@ class LLMClient:
 
     async def get_response(
         self, messages: List[Dict[str, str]], tools: Optional[List[Tool]] = None
-    ) -> str | None:
+    ) -> str:
         """Get response from the configured LLM."""
         llm_model = self.config.llm_model.lower()
 
@@ -132,7 +130,7 @@ class LLMClient:
 
     async def _get_openai_response(
         self, messages: List[Dict[str, str]], tools: Optional[List[Tool]] = None
-    ) -> str | None:
+    ) -> str:  # type: ignore[no-untyped-def]
         """Get response from OpenAI API."""
         system_message = self._build_system_message(tools)
 
@@ -164,7 +162,7 @@ class LLMClient:
 
     async def _get_groq_response(
         self, messages: List[Dict[str, str]], tools: Optional[List[Tool]] = None
-    ) -> str | None:
+    ) -> str:  # type: ignore[no-untyped-def]
         """Get response from Groq API."""
         system_message = self._build_system_message(tools)
 
@@ -196,7 +194,7 @@ class LLMClient:
 
     async def _get_anthropic_response(
         self, messages: List[Dict[str, str]], tools: Optional[List[Tool]] = None
-    ) -> str | None:
+    ) -> str:  # type: ignore[no-untyped-def]
         """Get response from Anthropic API."""
         system_message = self._build_system_message(tools)
 
@@ -382,11 +380,11 @@ class SlackMCPBot:
             # Try to get user info from Slack
             try:
                 user_info = await self.slack_client.users_info(user=slack_user_id)
-                profile = user_info["user"].get("profile", {})
+                profile = user_info.get("user", {}).get("profile", {})
 
                 return await user_repo.get_or_create_user(
                     slack_user_id=slack_user_id,
-                    slack_team_id=self.team_id,
+                    slack_team_id=self.team_id or "",
                     email=profile.get("email"),
                     display_name=profile.get("display_name"),
                     real_name=profile.get("real_name"),
@@ -394,7 +392,7 @@ class SlackMCPBot:
             except SlackApiError:
                 # Fallback if we can't get user info
                 return await user_repo.get_or_create_user(
-                    slack_user_id=slack_user_id, slack_team_id=self.team_id
+                    slack_user_id=slack_user_id, slack_team_id=self.team_id or ""
                 )
 
     async def _handle_mention(self, event: Dict[str, Any], say: Any) -> None:
@@ -403,6 +401,9 @@ class SlackMCPBot:
         channel_id = event.get("channel")
         thread_ts = event.get("thread_ts", event.get("ts"))
         text = event.get("text", "")
+
+        if not user_id or not channel_id or not thread_ts:
+            return
 
         # Remove bot mention from text
         text = text.replace(f"<@{self.bot_id}>", "").strip()
@@ -419,6 +420,9 @@ class SlackMCPBot:
         channel_id = message.get("channel")
         thread_ts = message.get("thread_ts", message.get("ts"))
         text = message.get("text", "")
+
+        if not user_id or not channel_id or not thread_ts:
+            return
 
         await self._process_user_message(user_id, channel_id, thread_ts, text, say)
 
@@ -441,7 +445,7 @@ class SlackMCPBot:
 
             # Add user message
             await conv_repo.add_message(
-                conversation_id=conversation.id,
+                conversation_id=conversation.id,  # type: ignore[arg-type]
                 role="user",
                 content=text,
                 slack_ts=thread_ts,
@@ -449,7 +453,7 @@ class SlackMCPBot:
 
             # Get recent messages
             messages = await conv_repo.get_conversation_messages(
-                conversation_id=conversation.id, limit=10
+                conversation_id=conversation.id, limit=10  # type: ignore[arg-type]
             )
 
             # Format messages for LLM
@@ -472,10 +476,13 @@ class SlackMCPBot:
                 for tool in tools
             ]
 
-            response = await self.llm_client.get_response(llm_messages, tool_objects)
+            response = await self.llm_client.get_response(llm_messages, tool_objects)  # type: ignore[no-untyped-call]
 
             # Process tool calls
-            response = await self._process_tool_calls(user, response)
+            if response:
+                response = await self._process_tool_calls(user, response)
+            else:
+                response = "Sorry, I couldn't generate a response."
 
             # Update thinking message with response
             await self.slack_client.chat_update(
@@ -486,7 +493,7 @@ class SlackMCPBot:
             async with self.db_manager.session() as session:
                 conv_repo = ConversationRepository(session)
                 await conv_repo.add_message(
-                    conversation_id=conversation.id,
+                    conversation_id=conversation.id,  # type: ignore[arg-type]
                     role="assistant",
                     content=response,
                     slack_ts=thinking_msg["ts"],
@@ -507,14 +514,14 @@ class SlackMCPBot:
             cred_repo = CredentialRepository(session)
 
             # Get user's enabled servers
-            servers = await server_repo.get_user_enabled_servers(user.id)
+            servers = await server_repo.get_user_enabled_servers(user.id)  # type: ignore[arg-type]
 
             for server in servers:
                 # Check if user has required credentials
                 missing_creds = await self.auth_service.check_missing_credentials(
-                    user.slack_user_id,
-                    self.team_id,
-                    server.name,
+                    user.slack_user_id,  # type: ignore[arg-type]
+                    self.team_id or "",
+                    server.name,  # type: ignore[arg-type]
                     {
                         "command": server.command,
                         "args": server.args,
@@ -525,8 +532,8 @@ class SlackMCPBot:
 
                 if not missing_creds:
                     # Get user credentials for this server
-                    user_creds = await cred_repo.get_user_credentials(user.id)
-                    server_creds = user_creds.get(server.name, {})
+                    user_creds = await cred_repo.get_user_credentials(user.id)  # type: ignore[arg-type]
+                    server_creds = user_creds.get(server.name, {})  # type: ignore[arg-type]
 
                     # Get or create user server instance
                     user_server = await self.user_server_manager.get_or_create_server(
@@ -593,7 +600,7 @@ class SlackMCPBot:
         async with self.db_manager.session() as session:
             server_repo = ServerRepository(session)
             all_servers = await server_repo.get_all_servers()
-            user_servers = await server_repo.get_user_enabled_servers(user.id)
+            user_servers = await server_repo.get_user_enabled_servers(user.id)  # type: ignore[arg-type]
             user_server_ids = {s.id for s in user_servers}
 
         # Build home view
@@ -710,7 +717,8 @@ async def main() -> None:
 
     if not config.encryption_key and not config.master_password:
         logger.error(
-            "Missing encryption configuration. Please set ENCRYPTION_KEY or MASTER_PASSWORD"
+            "Missing encryption configuration. Please set ENCRYPTION_KEY or "
+            "MASTER_PASSWORD"
         )
         sys.exit(1)
 

@@ -14,4 +14,7 @@ asyncpg>=0.29.0
 # Development dependencies
 pyright>=1.1.379
 pytest>=8.3.3
+pytest-asyncio>=1.0.0
+aiosqlite>=0.21.0
+greenlet>=3.0.0
 ruff>=0.6.9

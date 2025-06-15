@@ -1,24 +1,26 @@
 import os
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Optional
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
+
 from .models import Base
 
 
 class DatabaseManager:
     def __init__(self, database_url: Optional[str] = None):
         self.database_url = database_url or os.getenv(
-            "DATABASE_URL", 
-            "postgresql+asyncpg://postgres:postgres@localhost/mcp_slackbot"
+            "DATABASE_URL",
+            "postgresql+asyncpg://postgres:postgres@localhost/mcp_slackbot",
         )
-        
+
         self.engine = create_async_engine(
             self.database_url,
             echo=os.getenv("SQL_ECHO", "false").lower() == "true",
             poolclass=NullPool,
         )
-        
+
         self.async_session_maker = async_sessionmaker(
             self.engine,
             class_=AsyncSession,

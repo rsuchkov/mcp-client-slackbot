@@ -1,18 +1,19 @@
-import os
 import asyncio
-from logging.config import fileConfig
-from sqlalchemy import pool
-from sqlalchemy.engine import Connection
-from sqlalchemy.ext.asyncio import async_engine_from_config
-from alembic import context
+import os
 
 # Add parent directory to path to import our models
 import sys
+from logging.config import fileConfig
 from pathlib import Path
+
+from alembic import context
+from sqlalchemy import pool
+from sqlalchemy.engine import Connection
+from sqlalchemy.ext.asyncio import async_engine_from_config
+
 sys.path.append(str(Path(__file__).parent.parent))
 
 from database.models import Base
-from database.session import DatabaseManager
 
 # this is the Alembic Config object
 config = context.config
@@ -25,7 +26,9 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 # Get database URL from environment or use default
-database_url = os.getenv("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost/mcp_slackbot")
+database_url = os.getenv(
+    "DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost/mcp_slackbot"
+)
 config.set_main_option("sqlalchemy.url", database_url)
 
 
@@ -52,9 +55,9 @@ def do_run_migrations(connection: Connection) -> None:
 
 async def run_async_migrations() -> None:
     """Run migrations in 'online' mode with asyncio."""
-    configuration = config.get_section(config.config_ini_section)
+    configuration = config.get_section(config.config_ini_section) or {}
     configuration["sqlalchemy.url"] = database_url
-    
+
     connectable = async_engine_from_config(
         configuration,
         prefix="sqlalchemy.",

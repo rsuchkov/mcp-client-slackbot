@@ -107,9 +107,9 @@ class Server:
         server_params = StdioServerParameters(
             command=command,
             args=self.config["args"],
-            env={**os.environ, **self.config["env"]}
-            if self.config.get("env")
-            else None,
+            env=(
+                {**os.environ, **self.config["env"]} if self.config.get("env") else None
+            ),
         )
         try:
             stdio_transport = await self.exit_stack.enter_async_context(
@@ -269,7 +269,7 @@ class LLMClient:
         else:
             raise ValueError(f"Unsupported model: {self.model}")
 
-    async def _get_openai_response(self, messages: List[Dict[str, str]]) -> str:
+    async def _get_openai_response(self, messages: List[Dict[str, str]]) -> str:  # type: ignore[no-untyped-def]
         """Get a response from the OpenAI API."""
         url = "https://api.openai.com/v1/chat/completions"
         headers = {
@@ -304,7 +304,7 @@ class LLMClient:
                     return f"Failed to get response: {str(e)}"
                 await asyncio.sleep(2**attempt)  # Exponential backoff
 
-    async def _get_groq_response(self, messages: List[Dict[str, str]]) -> str:
+    async def _get_groq_response(self, messages: List[Dict[str, str]]) -> str:  # type: ignore[no-untyped-def]
         """Get a response from the Groq API."""
         url = "https://api.groq.com/openai/v1/chat/completions"
         headers = {
@@ -339,7 +339,7 @@ class LLMClient:
                     return f"Failed to get response: {str(e)}"
                 await asyncio.sleep(2**attempt)  # Exponential backoff
 
-    async def _get_anthropic_response(self, messages: List[Dict[str, str]]) -> str:
+    async def _get_anthropic_response(self, messages: List[Dict[str, str]]) -> str:  # type: ignore[no-untyped-def]
         """Get a response from the Anthropic API."""
         url = "https://api.anthropic.com/v1/messages"
         headers = {

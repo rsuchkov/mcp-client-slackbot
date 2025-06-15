@@ -1,6 +1,7 @@
-import os
 import base64
+import os
 from typing import Optional
+
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -17,15 +18,16 @@ class EncryptionService:
         encryption_key = os.getenv("ENCRYPTION_KEY")
         if encryption_key:
             return Fernet(encryption_key.encode())
-        
+
         master_password = os.getenv("MASTER_PASSWORD")
         if not master_password:
             raise ValueError(
-                "Either ENCRYPTION_KEY or MASTER_PASSWORD must be set in environment variables"
+                "Either ENCRYPTION_KEY or MASTER_PASSWORD must be set in "
+                "environment variables"
             )
-        
+
         salt = os.getenv("ENCRYPTION_SALT", "mcp-slackbot-default-salt").encode()
-        
+
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
