@@ -2,22 +2,34 @@ import asyncio
 import json
 import logging
 import os
-import shutil
-from contextlib import AsyncExitStack
-from typing import Any, Dict, List
+import sys
+from typing import Any, Dict, List, Optional
+from contextlib import asynccontextmanager
 
 import httpx
 from dotenv import load_dotenv
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 from slack_sdk.web.async_client import AsyncWebClient
+from slack_sdk.errors import SlackApiError
+
+from .database.session import get_db_manager
+from .database.repositories import (
+    UserRepository,
+    CredentialRepository,
+    ServerRepository,
+    ConversationRepository,
+    UserServerConfigRepository,
+)
+from .services.user_server import UserServerManager
+from .services.slack_auth import SlackAuthService
+from .services.mcp_metadata import MCPMetadataParser
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
+logger = logging.getLogger(__name__)
 
 
 class Configuration:
@@ -32,6 +44,12 @@ class Configuration:
         self.groq_api_key = os.getenv("GROQ_API_KEY")
         self.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
         self.llm_model = os.getenv("LLM_MODEL", "gpt-4-turbo")
+        self.database_url = os.getenv(
+            "DATABASE_URL",
+            "postgresql+asyncpg://postgres:postgres@localhost/mcp_slackbot",
+        )
+        self.encryption_key = os.getenv("ENCRYPTION_KEY")
+        self.master_password = os.getenv("MASTER_PASSWORD")
 
     @staticmethod
     def load_env() -> None:
@@ -40,31 +58,13 @@ class Configuration:
 
     @staticmethod
     def load_config(file_path: str) -> Dict[str, Any]:
-        """Load server configuration from JSON file.
-
-        Args:
-            file_path: Path to the JSON configuration file.
-
-        Returns:
-            Dict containing server configuration.
-
-        Raises:
-            FileNotFoundError: If configuration file doesn't exist.
-            JSONDecodeError: If configuration file is invalid JSON.
-        """
+        """Load server configuration from JSON file."""
         with open(file_path, "r") as f:
             return json.load(f)
 
     @property
     def llm_api_key(self) -> str:
-        """Get the appropriate LLM API key based on the model.
-
-        Returns:
-            The API key as a string.
-
-        Raises:
-            ValueError: If no API key is found for the selected model.
-        """
+        """Get the appropriate LLM API key based on the model."""
         if "gpt" in self.llm_model.lower() and self.openai_api_key:
             return self.openai_api_key
         elif "llama" in self.llm_model.lower() and self.groq_api_key:
@@ -83,657 +83,655 @@ class Configuration:
         raise ValueError("No API key found for any LLM provider")
 
 
-class Server:
-    """Manages MCP server connections and tool execution."""
-
-    def __init__(self, name: str, config: Dict[str, Any]) -> None:
-        self.name: str = name
-        self.config: Dict[str, Any] = config
-        self.stdio_context: Any | None = None
-        self.session: ClientSession | None = None
-        self._cleanup_lock: asyncio.Lock = asyncio.Lock()
-        self.exit_stack: AsyncExitStack = AsyncExitStack()
-
-    async def initialize(self) -> None:
-        """Initialize the server connection."""
-        command = (
-            shutil.which("npx")
-            if self.config["command"] == "npx"
-            else self.config["command"]
-        )
-        if command is None:
-            raise ValueError("The command must be a valid string and cannot be None.")
-
-        server_params = StdioServerParameters(
-            command=command,
-            args=self.config["args"],
-            env={**os.environ, **self.config["env"]}
-            if self.config.get("env")
-            else None,
-        )
-        try:
-            stdio_transport = await self.exit_stack.enter_async_context(
-                stdio_client(server_params)
-            )
-            read, write = stdio_transport
-            session = await self.exit_stack.enter_async_context(
-                ClientSession(read, write)
-            )
-            await session.initialize()
-            self.session = session
-        except Exception as e:
-            logging.error(f"Error initializing server {self.name}: {e}")
-            await self.cleanup()
-            raise
-
-    async def list_tools(self) -> List[Any]:
-        """List available tools from the server.
-
-        Returns:
-            A list of available tools.
-
-        Raises:
-            RuntimeError: If the server is not initialized.
-        """
-        if not self.session:
-            raise RuntimeError(f"Server {self.name} not initialized")
-
-        tools_response = await self.session.list_tools()
-        tools = []
-
-        for item in tools_response:
-            if isinstance(item, tuple) and item[0] == "tools":
-                for tool in item[1]:
-                    tools.append(Tool(tool.name, tool.description, tool.inputSchema))
-
-        return tools
-
-    async def execute_tool(
-        self,
-        tool_name: str,
-        arguments: Dict[str, Any],
-        retries: int = 2,
-        delay: float = 1.0,
-    ) -> Any:
-        """Execute a tool with retry mechanism.
-
-        Args:
-            tool_name: Name of the tool to execute.
-            arguments: Tool arguments.
-            retries: Number of retry attempts.
-            delay: Delay between retries in seconds.
-
-        Returns:
-            Tool execution result.
-
-        Raises:
-            RuntimeError: If server is not initialized.
-            Exception: If tool execution fails after all retries.
-        """
-        if not self.session:
-            raise RuntimeError(f"Server {self.name} not initialized")
-
-        attempt = 0
-        while attempt < retries:
-            try:
-                logging.info(f"Executing {tool_name}...")
-                result = await self.session.call_tool(tool_name, arguments)
-                return result
-            except Exception as e:
-                attempt += 1
-                logging.warning(
-                    f"Error executing tool: {e}. Attempt {attempt} of {retries}."
-                )
-                if attempt < retries:
-                    logging.info(f"Retrying in {delay} seconds...")
-                    await asyncio.sleep(delay)
-                else:
-                    logging.error("Max retries reached. Failing.")
-                    raise
-
-    async def cleanup(self) -> None:
-        """Clean up server resources."""
-        async with self._cleanup_lock:
-            try:
-                await self.exit_stack.aclose()
-                self.session = None
-                self.stdio_context = None
-            except Exception as e:
-                logging.error(f"Error during cleanup of server {self.name}: {e}")
-
-
 class Tool:
-    """Represents a tool with its properties and formatting."""
+    """Represents a tool available from MCP servers."""
 
     def __init__(
-        self, name: str, description: str, input_schema: Dict[str, Any]
+        self,
+        name: str,
+        description: str,
+        input_schema: Dict[str, Any],
+        server_name: str,
     ) -> None:
-        self.name: str = name
-        self.description: str = description
-        self.input_schema: Dict[str, Any] = input_schema
+        self.name = name
+        self.description = description
+        self.input_schema = input_schema
+        self.server_name = server_name
 
     def format_for_llm(self) -> str:
-        """Format tool information for LLM.
-
-        Returns:
-            A formatted string describing the tool.
-        """
-        args_desc = []
-        if "properties" in self.input_schema:
-            for param_name, param_info in self.input_schema["properties"].items():
-                arg_desc = (
-                    f"- {param_name}: {param_info.get('description', 'No description')}"
-                )
-                if param_name in self.input_schema.get("required", []):
-                    arg_desc += " (required)"
-                args_desc.append(arg_desc)
-
-        return f"""
-Tool: {self.name}
+        """Format tool information for LLM understanding."""
+        schema_str = json.dumps(self.input_schema, indent=2)
+        return f"""Tool: {self.name}
+Server: {self.server_name}
 Description: {self.description}
-Arguments:
-{chr(10).join(args_desc)}
-"""
+Input Schema:
+{schema_str}"""
 
 
 class LLMClient:
-    """Client for communicating with LLM APIs."""
+    """Handles communication with various LLM providers."""
 
-    def __init__(self, api_key: str, model: str) -> None:
-        """Initialize the LLM client.
+    def __init__(self, config: Configuration) -> None:
+        self.config = config
+        self.client = httpx.AsyncClient(timeout=30.0)
 
-        Args:
-            api_key: API key for the LLM provider
-            model: Model identifier to use
-        """
-        self.api_key = api_key
-        self.model = model
-        self.timeout = 30.0  # 30 second timeout
-        self.max_retries = 2
+    async def get_response(
+        self, messages: List[Dict[str, str]], tools: Optional[List[Tool]] = None
+    ) -> str | None:
+        """Get response from the configured LLM."""
+        llm_model = self.config.llm_model.lower()
 
-    async def get_response(self, messages: List[Dict[str, str]]) -> str:
-        """Get a response from the LLM.
-
-        Args:
-            messages: List of conversation messages
-
-        Returns:
-            Text response from the LLM
-        """
-        if self.model.startswith("gpt-") or self.model.startswith("ft:gpt-"):
-            return await self._get_openai_response(messages)
-        elif self.model.startswith("llama-"):
-            return await self._get_groq_response(messages)
-        elif self.model.startswith("claude-"):
-            return await self._get_anthropic_response(messages)
+        if "gpt" in llm_model:
+            return await self._get_openai_response(messages, tools)
+        elif "llama" in llm_model:
+            return await self._get_groq_response(messages, tools)
+        elif "claude" in llm_model:
+            return await self._get_anthropic_response(messages, tools)
         else:
-            raise ValueError(f"Unsupported model: {self.model}")
+            return await self._get_openai_response(messages, tools)
 
-    async def _get_openai_response(self, messages: List[Dict[str, str]]) -> str:
-        """Get a response from the OpenAI API."""
-        url = "https://api.openai.com/v1/chat/completions"
+    async def _get_openai_response(
+        self, messages: List[Dict[str, str]], tools: Optional[List[Tool]] = None
+    ) -> str | None:
+        """Get response from OpenAI API."""
+        system_message = self._build_system_message(tools)
+
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {self.config.openai_api_key}",
             "Content-Type": "application/json",
         }
 
-        payload = {
-            "model": self.model,
-            "messages": messages,
+        data = {
+            "model": self.config.llm_model,
+            "messages": [{"role": "system", "content": system_message}] + messages,
             "temperature": 0.7,
-            "max_tokens": 1500,
         }
 
-        for attempt in range(self.max_retries + 1):
+        for attempt in range(3):
             try:
-                async with httpx.AsyncClient(timeout=self.timeout) as client:
-                    response = await client.post(url, json=payload, headers=headers)
-
-                    if response.status_code == 200:
-                        response_data = response.json()
-                        return response_data["choices"][0]["message"]["content"]
-                    else:
-                        if attempt == self.max_retries:
-                            return (
-                                f"Error from API: {response.status_code} - "
-                                f"{response.text}"
-                            )
-                        await asyncio.sleep(2**attempt)  # Exponential backoff
-            except Exception as e:
-                if attempt == self.max_retries:
-                    return f"Failed to get response: {str(e)}"
-                await asyncio.sleep(2**attempt)  # Exponential backoff
-
-    async def _get_groq_response(self, messages: List[Dict[str, str]]) -> str:
-        """Get a response from the Groq API."""
-        url = "https://api.groq.com/openai/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": 0.7,
-            "max_tokens": 1500,
-        }
-
-        for attempt in range(self.max_retries + 1):
-            try:
-                async with httpx.AsyncClient(timeout=self.timeout) as client:
-                    response = await client.post(url, json=payload, headers=headers)
-
-                    if response.status_code == 200:
-                        response_data = response.json()
-                        return response_data["choices"][0]["message"]["content"]
-                    else:
-                        if attempt == self.max_retries:
-                            return (
-                                f"Error from API: {response.status_code} - "
-                                f"{response.text}"
-                            )
-                        await asyncio.sleep(2**attempt)  # Exponential backoff
-            except Exception as e:
-                if attempt == self.max_retries:
-                    return f"Failed to get response: {str(e)}"
-                await asyncio.sleep(2**attempt)  # Exponential backoff
-
-    async def _get_anthropic_response(self, messages: List[Dict[str, str]]) -> str:
-        """Get a response from the Anthropic API."""
-        url = "https://api.anthropic.com/v1/messages"
-        headers = {
-            "anthropic-version": "2023-06-01",
-            "x-api-key": self.api_key,
-            "Content-Type": "application/json",
-        }
-
-        # Convert messages to Anthropic format
-        system_message = None
-        anthropic_messages = []
-
-        for msg in messages:
-            if msg["role"] == "system":
-                system_message = msg["content"]
-            elif msg["role"] == "user":
-                anthropic_messages.append({"role": "user", "content": msg["content"]})
-            elif msg["role"] == "assistant":
-                anthropic_messages.append(
-                    {"role": "assistant", "content": msg["content"]}
+                response = await self.client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers=headers,
+                    json=data,
                 )
+                response.raise_for_status()
+                return response.json()["choices"][0]["message"]["content"]
+            except Exception as e:
+                if attempt == 2:
+                    logger.error(f"OpenAI API error after 3 attempts: {e}")
+                    raise
+                await asyncio.sleep(2**attempt)
 
-        payload = {
-            "model": self.model,
-            "messages": anthropic_messages,
-            "temperature": 0.7,
-            "max_tokens": 1500,
+    async def _get_groq_response(
+        self, messages: List[Dict[str, str]], tools: Optional[List[Tool]] = None
+    ) -> str | None:
+        """Get response from Groq API."""
+        system_message = self._build_system_message(tools)
+
+        headers = {
+            "Authorization": f"Bearer {self.config.groq_api_key}",
+            "Content-Type": "application/json",
         }
 
-        if system_message:
-            payload["system"] = system_message
+        data = {
+            "model": self.config.llm_model,
+            "messages": [{"role": "system", "content": system_message}] + messages,
+            "temperature": 0.7,
+        }
 
-        for attempt in range(self.max_retries + 1):
+        for attempt in range(3):
             try:
-                async with httpx.AsyncClient(timeout=self.timeout) as client:
-                    response = await client.post(url, json=payload, headers=headers)
-
-                    if response.status_code == 200:
-                        response_data = response.json()
-                        return response_data["content"][0]["text"]
-                    else:
-                        if attempt == self.max_retries:
-                            return (
-                                f"Error from API: {response.status_code} - "
-                                f"{response.text}"
-                            )
-                        await asyncio.sleep(2**attempt)  # Exponential backoff
+                response = await self.client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=headers,
+                    json=data,
+                )
+                response.raise_for_status()
+                return response.json()["choices"][0]["message"]["content"]
             except Exception as e:
-                if attempt == self.max_retries:
-                    return f"Failed to get response: {str(e)}"
-                await asyncio.sleep(2**attempt)  # Exponential backoff
+                if attempt == 2:
+                    logger.error(f"Groq API error after 3 attempts: {e}")
+                    raise
+                await asyncio.sleep(2**attempt)
+
+    async def _get_anthropic_response(
+        self, messages: List[Dict[str, str]], tools: Optional[List[Tool]] = None
+    ) -> str | None:
+        """Get response from Anthropic API."""
+        system_message = self._build_system_message(tools)
+
+        headers = {
+            "x-api-key": self.config.anthropic_api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        }
+
+        anthropic_messages = []
+        for msg in messages:
+            anthropic_messages.append(
+                {
+                    "role": msg["role"] if msg["role"] != "system" else "user",
+                    "content": msg["content"],
+                }
+            )
+
+        data = {
+            "model": self.config.llm_model,
+            "system": system_message,
+            "messages": anthropic_messages,
+            "max_tokens": 4096,
+        }
+
+        for attempt in range(3):
+            try:
+                response = await self.client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers=headers,
+                    json=data,
+                )
+                response.raise_for_status()
+                return response.json()["content"][0]["text"]
+            except Exception as e:
+                if attempt == 2:
+                    logger.error(f"Anthropic API error after 3 attempts: {e}")
+                    raise
+                await asyncio.sleep(2**attempt)
+
+    def _build_system_message(self, tools: Optional[List[Tool]] = None) -> str:
+        """Build system message with tool information."""
+        base_message = """You are a helpful AI assistant integrated with Slack. 
+You can execute tools to help users with various tasks.
+
+When you need to execute a tool, use the following format:
+[TOOL: tool_name]
+{
+  "arg1": "value1",
+  "arg2": "value2"
+}
+[/TOOL]
+
+You can use multiple tools in a single response if needed."""
+
+        if tools:
+            tool_descriptions = "\n\n".join([tool.format_for_llm() for tool in tools])
+            return f"{base_message}\n\nAvailable tools:\n\n{tool_descriptions}"
+
+        return base_message
+
+    async def close(self):
+        """Close the HTTP client."""
+        await self.client.aclose()
 
 
 class SlackMCPBot:
-    """Manages the Slack bot integration with MCP servers."""
+    """Main bot class handling Slack integration with multi-user support."""
 
     def __init__(
         self,
-        slack_bot_token: str,
-        slack_app_token: str,
-        servers: List[Server],
+        config: Configuration,
         llm_client: LLMClient,
     ) -> None:
-        self.app = AsyncApp(token=slack_bot_token)
-        # Create a socket mode handler with the app token
-        self.socket_mode_handler = AsyncSocketModeHandler(self.app, slack_app_token)
-
-        self.client = AsyncWebClient(token=slack_bot_token)
-        self.servers = servers
+        self.config = config
         self.llm_client = llm_client
-        self.conversations = {}  # Store conversation context per channel
-        self.tools = []
+        self.user_server_manager = UserServerManager()
+        self.db_manager = get_db_manager()
 
-        # Set up event handlers
-        self.app.event("app_mention")(self.handle_mention)
-        self.app.message()(self.handle_message)
-        self.app.event("app_home_opened")(self.handle_home_opened)
+        # Initialize Slack app
+        self.app = AsyncApp(token=config.slack_bot_token)
+        self.socket_mode_handler = AsyncSocketModeHandler(
+            self.app, config.slack_app_token
+        )
+        self.slack_client = AsyncWebClient(token=config.slack_bot_token)
+        self.auth_service = SlackAuthService(self.slack_client)
 
-    async def initialize_servers(self) -> None:
-        """Initialize all MCP servers and discover tools."""
-        for server in self.servers:
+        # Bot info
+        self.bot_id: Optional[str] = None
+        self.team_id: Optional[str] = None
+
+        # Setup event handlers
+        self._setup_event_handlers()
+
+    def _setup_event_handlers(self) -> None:
+        """Setup Slack event handlers."""
+
+        # Handle mentions
+        @self.app.event("app_mention")
+        async def handle_mention(event: Dict[str, Any], say: Any) -> None:
+            await self._handle_mention(event, say)
+
+        # Handle direct messages
+        @self.app.message("")
+        async def handle_message(message: Dict[str, Any], say: Any) -> None:
+            await self._handle_message(message, say)
+
+        # Handle app home opened
+        @self.app.event("app_home_opened")
+        async def handle_home_opened(
+            event: Dict[str, Any], client: AsyncWebClient
+        ) -> None:
+            await self._handle_home_opened(event, client)
+
+        # Handle interactive actions
+        @self.app.action("submit_credential")
+        async def handle_credential_submission(ack: Any, body: Dict[str, Any]) -> None:
+            await ack()
+            await self._handle_credential_submission(body)
+
+        @self.app.action("cancel_credential_flow")
+        async def handle_credential_cancel(ack: Any, body: Dict[str, Any]) -> None:
+            await ack()
+            await self._handle_credential_cancel(body)
+
+    async def initialize(self) -> None:
+        """Initialize the bot, database, and load server configurations."""
+        # Initialize database
+        await self.db_manager.create_tables()
+
+        # Get bot info
+        auth_response = await self.slack_client.auth_test()
+        self.bot_id = auth_response["user_id"]
+        self.team_id = auth_response["team_id"]
+
+        # Load and sync server configurations
+        await self._sync_server_configurations()
+
+    async def _sync_server_configurations(self) -> None:
+        """Sync server configurations from JSON to database."""
+        config_file = "servers_config.json"
+        if os.path.exists(config_file):
+            config_data = self.config.load_config(config_file)
+
+            async with self.db_manager.session() as session:
+                server_repo = ServerRepository(session)
+
+                for server_name, server_config in config_data.get(
+                    "mcpServers", {}
+                ).items():
+                    existing = await server_repo.get_server_by_name(server_name)
+
+                    if not existing:
+                        # Parse required credentials
+                        required_creds = MCPMetadataParser.parse_server_metadata(
+                            server_config
+                        )
+                        required_creds_data = [
+                            {
+                                "type": cred.type,
+                                "name": cred.name,
+                                "description": cred.description,
+                                "env_var": cred.env_var,
+                                "validation_regex": cred.validation_regex,
+                            }
+                            for cred in required_creds
+                        ]
+
+                        await server_repo.create_server(
+                            name=server_name,
+                            command=server_config.get("command", ""),
+                            args=server_config.get("args", []),
+                            env=server_config.get("env", {}),
+                            required_credentials=required_creds_data,
+                            description=server_config.get("description", ""),
+                        )
+
+    async def _get_or_create_user(self, slack_user_id: str) -> Any:
+        """Get or create user from Slack ID."""
+        async with self.db_manager.session() as session:
+            user_repo = UserRepository(session)
+
+            # Try to get user info from Slack
             try:
-                await server.initialize()
-                server_tools = await server.list_tools()
-                self.tools.extend(server_tools)
-                logging.info(
-                    f"Initialized server {server.name} with {len(server_tools)} tools"
+                user_info = await self.slack_client.users_info(user=slack_user_id)
+                profile = user_info["user"].get("profile", {})
+
+                return await user_repo.get_or_create_user(
+                    slack_user_id=slack_user_id,
+                    slack_team_id=self.team_id,
+                    email=profile.get("email"),
+                    display_name=profile.get("display_name"),
+                    real_name=profile.get("real_name"),
                 )
-            except Exception as e:
-                logging.error(f"Failed to initialize server {server.name}: {e}")
+            except SlackApiError:
+                # Fallback if we can't get user info
+                return await user_repo.get_or_create_user(
+                    slack_user_id=slack_user_id, slack_team_id=self.team_id
+                )
 
-    async def initialize_bot_info(self) -> None:
-        """Get the bot's ID and other info."""
+    async def _handle_mention(self, event: Dict[str, Any], say: Any) -> None:
+        """Handle @mentions in channels."""
+        user_id = event.get("user")
+        channel_id = event.get("channel")
+        thread_ts = event.get("thread_ts", event.get("ts"))
+        text = event.get("text", "")
+
+        # Remove bot mention from text
+        text = text.replace(f"<@{self.bot_id}>", "").strip()
+
+        await self._process_user_message(user_id, channel_id, thread_ts, text, say)
+
+    async def _handle_message(self, message: Dict[str, Any], say: Any) -> None:
+        """Handle direct messages."""
+        # Skip bot's own messages
+        if message.get("user") == self.bot_id:
+            return
+
+        user_id = message.get("user")
+        channel_id = message.get("channel")
+        thread_ts = message.get("thread_ts", message.get("ts"))
+        text = message.get("text", "")
+
+        await self._process_user_message(user_id, channel_id, thread_ts, text, say)
+
+    async def _process_user_message(
+        self, user_id: str, channel_id: str, thread_ts: str, text: str, say: Any
+    ) -> None:
+        """Process a message from a user."""
+        # Get or create user
+        user = await self._get_or_create_user(user_id)
+
+        # Get user's available tools
+        tools = await self._get_user_tools(user)
+
+        # Get conversation history
+        async with self.db_manager.session() as session:
+            conv_repo = ConversationRepository(session)
+            conversation = await conv_repo.get_or_create_conversation(
+                user_id=user.id, slack_channel_id=channel_id, slack_thread_ts=thread_ts
+            )
+
+            # Add user message
+            await conv_repo.add_message(
+                conversation_id=conversation.id,
+                role="user",
+                content=text,
+                slack_ts=thread_ts,
+            )
+
+            # Get recent messages
+            messages = await conv_repo.get_conversation_messages(
+                conversation_id=conversation.id, limit=10
+            )
+
+            # Format messages for LLM
+            llm_messages = [
+                {"role": msg.role, "content": msg.content} for msg in messages
+            ]
+
+        # Get LLM response
         try:
-            auth_info = await self.client.auth_test()
-            self.bot_id = auth_info["user_id"]
-            logging.info(f"Bot initialized with ID: {self.bot_id}")
+            thinking_msg = await say(text="🤔 Thinking...", thread_ts=thread_ts)
+
+            # Convert tools to Tool objects
+            tool_objects = [
+                Tool(
+                    name=tool["name"],
+                    description=tool["description"],
+                    input_schema=tool["inputSchema"],
+                    server_name=tool["server"],
+                )
+                for tool in tools
+            ]
+
+            response = await self.llm_client.get_response(llm_messages, tool_objects)
+
+            # Process tool calls
+            response = await self._process_tool_calls(user, response)
+
+            # Update thinking message with response
+            await self.slack_client.chat_update(
+                channel=channel_id, ts=thinking_msg["ts"], text=response
+            )
+
+            # Save assistant response
+            async with self.db_manager.session() as session:
+                conv_repo = ConversationRepository(session)
+                await conv_repo.add_message(
+                    conversation_id=conversation.id,
+                    role="assistant",
+                    content=response,
+                    slack_ts=thinking_msg["ts"],
+                )
+
         except Exception as e:
-            logging.error(f"Failed to get bot info: {e}")
-            self.bot_id = None
+            logger.error(f"Error processing message: {e}")
+            await say(
+                text=f"❌ Sorry, I encountered an error: {str(e)}", thread_ts=thread_ts
+            )
 
-    async def handle_mention(self, event, say):
-        """Handle mentions of the bot in channels."""
-        await self._process_message(event, say)
+    async def _get_user_tools(self, user: Any) -> List[Dict[str, Any]]:
+        """Get available tools for a user."""
+        tools = []
 
-    async def handle_message(self, message, say):
-        """Handle direct messages to the bot."""
-        # Only process direct messages
-        if message.get("channel_type") == "im" and not message.get("subtype"):
-            await self._process_message(message, say)
+        async with self.db_manager.session() as session:
+            server_repo = ServerRepository(session)
+            cred_repo = CredentialRepository(session)
 
-    async def handle_home_opened(self, event, client):
-        """Handle when a user opens the App Home tab."""
+            # Get user's enabled servers
+            servers = await server_repo.get_user_enabled_servers(user.id)
+
+            for server in servers:
+                # Check if user has required credentials
+                missing_creds = await self.auth_service.check_missing_credentials(
+                    user.slack_user_id,
+                    self.team_id,
+                    server.name,
+                    {
+                        "command": server.command,
+                        "args": server.args,
+                        "env": server.env,
+                        "required_credentials": server.required_credentials,
+                    },
+                )
+
+                if not missing_creds:
+                    # Get user credentials for this server
+                    user_creds = await cred_repo.get_user_credentials(user.id)
+                    server_creds = user_creds.get(server.name, {})
+
+                    # Get or create user server instance
+                    user_server = await self.user_server_manager.get_or_create_server(
+                        user, server, server_creds
+                    )
+
+                    if user_server:
+                        server_tools = await user_server.list_tools()
+                        for tool in server_tools:
+                            tool["server"] = server.name
+                        tools.extend(server_tools)
+
+        return tools
+
+    async def _process_tool_calls(self, user: Any, response: str) -> str:
+        """Process tool calls in the response."""
+        import re
+
+        # Find all tool calls
+        tool_pattern = r"\[TOOL:\s*(\w+)\]\s*(.*?)\[/TOOL\]"
+        matches = re.finditer(tool_pattern, response, re.DOTALL)
+
+        for match in matches:
+            tool_name = match.group(1)
+            tool_args_str = match.group(2).strip()
+
+            try:
+                tool_args = json.loads(tool_args_str)
+            except json.JSONDecodeError:
+                continue
+
+            # Find the server that has this tool
+            user_servers = await self.user_server_manager.get_user_servers(user)
+
+            for user_server in user_servers:
+                tools = await user_server.list_tools()
+                if any(tool["name"] == tool_name for tool in tools):
+                    try:
+                        result = await user_server.call_tool(tool_name, tool_args)
+                        # Replace tool call with result
+                        response = response.replace(
+                            match.group(0),
+                            f"Tool result: {json.dumps(result, indent=2)}",
+                        )
+                    except Exception as e:
+                        response = response.replace(
+                            match.group(0), f"Tool error: {str(e)}"
+                        )
+                    break
+
+        return response
+
+    async def _handle_home_opened(
+        self, event: Dict[str, Any], client: AsyncWebClient
+    ) -> None:
+        """Handle app home opened event."""
         user_id = event["user"]
+        user = await self._get_or_create_user(user_id)
 
+        # Get user's tools
+        tools = await self._get_user_tools(user)
+
+        # Get all available servers
+        async with self.db_manager.session() as session:
+            server_repo = ServerRepository(session)
+            all_servers = await server_repo.get_all_servers()
+            user_servers = await server_repo.get_user_enabled_servers(user.id)
+            user_server_ids = {s.id for s in user_servers}
+
+        # Build home view
         blocks = [
-            {
-                "type": "header",
-                "text": {"type": "plain_text", "text": "Welcome to MCP Assistant!"},
-            },
             {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": (
-                        "I'm an AI assistant with access to tools and resources "
-                        "through the Model Context Protocol."
-                    ),
+                    "text": f"*Welcome to MCP Slackbot!* 👋\n\nHello <@{user_id}>!",
                 },
             },
+            {"type": "divider"},
             {
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": "*Available Tools:*"},
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Your Active Tools ({len(tools)})*",
+                },
             },
         ]
 
-        # Add tools
-        for tool in self.tools:
+        if tools:
+            tool_list = "\n".join(
+                [f"• `{tool['name']}` - {tool['description']}" for tool in tools[:10]]
+            )
+            if len(tools) > 10:
+                tool_list += f"\n... and {len(tools) - 10} more"
+
+            blocks.append(
+                {"type": "section", "text": {"type": "mrkdwn", "text": tool_list}}
+            )
+        else:
             blocks.append(
                 {
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"• *{tool.name}*: {tool.description}",
+                        "text": "_No tools available. Enable some MCP servers below._",
                     },
                 }
             )
 
-        # Add usage section
-        blocks.append(
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        "*How to Use:*\n• Send me a direct message\n"
-                        "• Mention me in a channel with @MCP Assistant"
-                    ),
+        blocks.extend(
+            [
+                {"type": "divider"},
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": "*Available MCP Servers*"},
                 },
-            }
+            ]
         )
 
-        try:
-            await client.views_publish(
-                user_id=user_id, view={"type": "home", "blocks": blocks}
-            )
-        except Exception as e:
-            logging.error(f"Error publishing home view: {e}")
+        for server in all_servers:
+            is_enabled = server.id in user_server_ids
+            status = "✅ Enabled" if is_enabled else "⬜ Disabled"
 
-    async def _process_message(self, event, say):
-        """Process incoming messages and generate responses."""
-        channel = event["channel"]
-        user_id = event.get("user")
-
-        # Skip messages from the bot itself
-        if user_id == getattr(self, "bot_id", None):
-            return
-
-        # Get text and remove bot mention if present
-        text = event.get("text", "")
-        if hasattr(self, "bot_id") and self.bot_id:
-            text = text.replace(f"<@{self.bot_id}>", "").strip()
-
-        thread_ts = event.get("thread_ts", event.get("ts"))
-
-        # Get or create conversation context
-        if channel not in self.conversations:
-            self.conversations[channel] = {"messages": []}
-
-        try:
-            # Create system message with tool descriptions
-            tools_text = "\n".join([tool.format_for_llm() for tool in self.tools])
-            system_message = {
-                "role": "system",
-                "content": (
-                    f"""You are a helpful assistant with access to the following tools:
-
-{tools_text}
-
-When you need to use a tool, you MUST format your response exactly like this:
-[TOOL] tool_name
-{{"param1": "value1", "param2": "value2"}}
-
-Make sure to include both the tool name AND the JSON arguments.
-Never leave out the JSON arguments.
-
-After receiving tool results, interpret them for the user in a helpful way.
-"""
-                ),
-            }
-
-            # Add user message to history
-            self.conversations[channel]["messages"].append(
-                {"role": "user", "content": text}
+            blocks.append(
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*{server.name}*\n{server.description}\n{status}",
+                    },
+                    "accessory": {
+                        "type": "button",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "Enable" if not is_enabled else "Disable",
+                        },
+                        "action_id": f"toggle_server_{server.id}",
+                        "value": server.name,
+                        "style": "primary" if not is_enabled else "danger",
+                    },
+                }
             )
 
-            # Set up messages for LLM
-            messages = [system_message]
+        await client.views_publish(
+            user_id=user_id, view={"type": "home", "blocks": blocks}
+        )
 
-            # Add conversation history (last 5 messages)
-            if "messages" in self.conversations[channel]:
-                messages.extend(self.conversations[channel]["messages"][-5:])
+    async def _handle_credential_submission(self, body: Dict[str, Any]) -> None:
+        """Handle credential submission from Slack."""
+        # Implementation for handling credential submissions
+        pass
 
-            # Get LLM response
-            response = await self.llm_client.get_response(messages)
-
-            # Process tool calls in the response
-            if "[TOOL]" in response:
-                response = await self._process_tool_call(response, channel)
-
-            # Add assistant response to conversation history
-            self.conversations[channel]["messages"].append(
-                {"role": "assistant", "content": response}
-            )
-
-            # Send the response to the user
-            await say(text=response, channel=channel, thread_ts=thread_ts)
-
-        except Exception as e:
-            error_message = f"I'm sorry, I encountered an error: {str(e)}"
-            logging.error(f"Error processing message: {e}", exc_info=True)
-            await say(text=error_message, channel=channel, thread_ts=thread_ts)
-
-    async def _process_tool_call(self, response: str, channel: str) -> str:
-        """Process a tool call from the LLM response."""
-        try:
-            # Extract tool name and arguments
-            tool_parts = response.split("[TOOL]")[1].strip().split("\n", 1)
-            tool_name = tool_parts[0].strip()
-
-            # Handle incomplete tool calls
-            if len(tool_parts) < 2:
-                return (
-                    f"I tried to use the tool '{tool_name}', but the request "
-                    f"was incomplete. Here's my response without the tool:"
-                    f"\n\n{response.split('[TOOL]')[0]}"
-                )
-
-            # Parse JSON arguments
-            try:
-                args_text = tool_parts[1].strip()
-                arguments = json.loads(args_text)
-            except json.JSONDecodeError:
-                return (
-                    f"I tried to use the tool '{tool_name}', but the arguments "
-                    f"were not properly formatted. Here's my response without "
-                    f"the tool:\n\n{response.split('[TOOL]')[0]}"
-                )
-
-            # Find the appropriate server for this tool
-            for server in self.servers:
-                server_tools = [tool.name for tool in await server.list_tools()]
-                if tool_name in server_tools:
-                    # Execute the tool
-                    tool_result = await server.execute_tool(tool_name, arguments)
-
-                    # Add tool result to conversation history
-                    tool_result_msg = f"Tool result for {tool_name}:\n{tool_result}"
-                    self.conversations[channel]["messages"].append(
-                        {"role": "system", "content": tool_result_msg}
-                    )
-
-                    try:
-                        # Get interpretation from LLM
-                        messages = [
-                            {
-                                "role": "system",
-                                "content": (
-                                    "You are a helpful assistant. You've just "
-                                    "used a tool and received results. Interpret "
-                                    "these results for the user in a clear, "
-                                    "helpful way."
-                                ),
-                            },
-                            {
-                                "role": "user",
-                                "content": (
-                                    f"I used the tool {tool_name} with arguments "
-                                    f"{args_text} and got this result:\n\n"
-                                    f"{tool_result}\n\n"
-                                    f"Please interpret this result for me."
-                                ),
-                            },
-                        ]
-
-                        interpretation = await self.llm_client.get_response(messages)
-                        return interpretation
-                    except Exception as e:
-                        logging.error(
-                            f"Error getting tool result interpretation: {e}",
-                            exc_info=True,
-                        )
-                        # Fallback to basic formatting
-                        if isinstance(tool_result, dict):
-                            result_text = json.dumps(tool_result, indent=2)
-                        else:
-                            result_text = str(tool_result)
-                        return (
-                            f"I used the {tool_name} tool and got these results:"
-                            f"\n\n```\n{result_text}\n```"
-                        )
-
-            # No server had the tool
-            return (
-                f"I tried to use the tool '{tool_name}', but it's not available. "
-                f"Here's my response without the tool:\n\n{response.split('[TOOL]')[0]}"
-            )
-
-        except Exception as e:
-            logging.error(f"Error executing tool: {e}", exc_info=True)
-            return (
-                f"I tried to use a tool, but encountered an error: {str(e)}\n\n"
-                f"Here's my response without the tool:\n\n{response.split('[TOOL]')[0]}"
-            )
+    async def _handle_credential_cancel(self, body: Dict[str, Any]) -> None:
+        """Handle credential flow cancellation."""
+        # Implementation for handling cancellations
+        pass
 
     async def start(self) -> None:
-        """Start the Slack bot."""
-        await self.initialize_servers()
-        await self.initialize_bot_info()
-        # Start the socket mode handler
-        logging.info("Starting Slack bot...")
-        asyncio.create_task(self.socket_mode_handler.start_async())
-        logging.info("Slack bot started and waiting for messages")
+        """Start the bot."""
+        await self.initialize()
+        logger.info("Starting Slack MCP Bot...")
+        await self.socket_mode_handler.start_async()
 
     async def cleanup(self) -> None:
-        """Clean up resources."""
-        try:
-            if hasattr(self, "socket_mode_handler"):
-                await self.socket_mode_handler.close_async()
-            logging.info("Slack socket mode handler closed")
-        except Exception as e:
-            logging.error(f"Error closing socket mode handler: {e}")
-
-        # Clean up servers
-        for server in self.servers:
-            try:
-                await server.cleanup()
-                logging.info(f"Server {server.name} cleaned up")
-            except Exception as e:
-                logging.error(f"Error during cleanup of server {server.name}: {e}")
+        """Cleanup resources."""
+        await self.user_server_manager.cleanup_all()
+        await self.llm_client.close()
+        await self.db_manager.close()
 
 
 async def main() -> None:
-    """Initialize and run the Slack bot."""
+    """Main entry point."""
     config = Configuration()
 
+    # Validate configuration
     if not config.slack_bot_token or not config.slack_app_token:
-        raise ValueError(
-            "SLACK_BOT_TOKEN and SLACK_APP_TOKEN must be set in environment variables"
+        logger.error(
+            "Missing Slack tokens. Please set SLACK_BOT_TOKEN and SLACK_APP_TOKEN"
         )
+        sys.exit(1)
 
-    server_config = config.load_config("servers_config.json")
-    servers = [
-        Server(name, srv_config)
-        for name, srv_config in server_config["mcpServers"].items()
-    ]
+    if not config.encryption_key and not config.master_password:
+        logger.error(
+            "Missing encryption configuration. Please set ENCRYPTION_KEY or MASTER_PASSWORD"
+        )
+        sys.exit(1)
 
-    llm_client = LLMClient(config.llm_api_key, config.llm_model)
+    # Create components
+    llm_client = LLMClient(config)
+    bot = SlackMCPBot(config, llm_client)
 
-    slack_bot = SlackMCPBot(
-        config.slack_bot_token, config.slack_app_token, servers, llm_client
-    )
+    # Handle shutdown
+    async def shutdown():
+        logger.info("Shutting down...")
+        await bot.cleanup()
 
+    # Run bot
     try:
-        await slack_bot.start()
-        # Keep the main task alive until interrupted
-        while True:
-            await asyncio.sleep(1)
+        await bot.start()
     except KeyboardInterrupt:
-        logging.info("Shutting down...")
+        await shutdown()
     except Exception as e:
-        logging.error(f"Error: {e}")
-    finally:
-        await slack_bot.cleanup()
+        logger.error(f"Bot error: {e}")
+        await shutdown()
+        sys.exit(1)
 
 
 if __name__ == "__main__":

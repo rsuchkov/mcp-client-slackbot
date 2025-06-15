@@ -5,6 +5,11 @@ mcp>=1.0.0
 httpx>=0.24.1
 aiohttp>=3.11.13
 uvicorn>=0.23.2
+sqlalchemy>=2.0.0
+alembic>=1.13.0
+cryptography>=41.0.0
+psycopg2-binary>=2.9.0
+asyncpg>=0.29.0
 
 # Development dependencies
 pyright>=1.1.379

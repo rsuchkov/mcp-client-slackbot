@@ -185,3 +185,5 @@ htmlcov/
 # OS specific
 .DS_Store
 Thumbs.db
+CLAUDE.md
+TODO.md
